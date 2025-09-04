@@ -1,0 +1,173 @@
+name: DARK-NOVA-XMD Deployment
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # Just under 6 hours
+
+    strategy:
+      matrix:
+        node-version: [20.x]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Use Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'  # This will cache node_modules
+
+    - name: Install dependencies
+      run: |
+        # Generate package-lock.json if it doesn't exist
+        if [ ! -f package-lock.json ]; then
+          echo "Generating package-lock.json..."
+          npm install --package-lock-only
+        fi
+        
+        # Install dependencies
+        npm ci  # Uses package-lock.json for deterministic installs
+
+    - name: Install FFmpeg
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+
+    - name: Create sessions directory
+      run: mkdir -p sessions
+
+    - name: Create config.env from secrets
+      run: |
+        touch config.env
+        echo "SESSION_ID=${{ secrets.SESSION_ID }}" >> config.env
+        echo "PREFIX=${{ secrets.PREFIX || '.' }}" >> config.env
+        echo "MODE=${{ secrets.MODE || 'public' }}" >> config.env
+        echo "OWNER_NUMBER=${{ secrets.OWNER_NUMBER || '94752978237' }}" >> config.env
+        echo "BOT_NAME=${{ secrets.BOT_NAME || 'DARK-NOVA-XMD' }}" >> config.env
+        echo "ALWAYS_ONLINE=${{ secrets.ALWAYS_ONLINE || 'false' }}" >> config.env
+        echo "AUTO_STATUS_SEEN=${{ secrets.AUTO_STATUS_SEEN || 'true' }}" >> config.env
+        echo "AUTO_STATUS_REACT=${{ secrets.AUTO_STATUS_REACT || 'true' }}" >> config.env
+        echo "ANTI_LINK=${{ secrets.ANTI_LINK || 'true' }}" >> config.env
+        echo "ANTI_DEL=${{ secrets.ANTI_DEL || 'true' }}" >> config.env
+        echo "WELCOME=${{ secrets.WELCOME || 'true' }}" >> config.env
+        echo "READ_MESSAGE=${{ secrets.READ_MESSAGE || 'false' }}" >> config.env
+
+    - name: Start application with auto-restart
+      run: |
+        # Create restart script
+        cat > restart_bot.sh << 'EOF'
+        #!/bin/bash
+        RESTART_COUNT=0
+        MAX_RESTARTS=10
+        
+        while [ $RESTART_COUNT -lt $MAX_RESTARTS ]; do
+          echo "Starting DARK-NOVA-XMD (Attempt $((RESTART_COUNT + 1))/$MAX_RESTARTS)..."
+          npm start &
+          PID=$!
+          
+          # Wait for process or 4.5 hours (16200 seconds)
+          for i in {1..16200}; do
+            if ! kill -0 $PID 2>/dev/null; then
+              echo "Bot process stopped, restarting..."
+              break
+            fi
+            sleep 1
+          done
+          
+          # If process is still running after 4.5 hours, restart it
+          if kill -0 $PID 2>/dev/null; then
+            echo "4.5-hour limit reached, restarting bot..."
+            kill $PID
+            wait $PID
+          fi
+          
+          RESTART_COUNT=$((RESTART_COUNT + 1))
+          sleep 5
+        done
+        
+        echo "Max restart attempts reached. Exiting."
+        exit 1
+        EOF
+        
+        chmod +x restart_bot.sh
+        ./restart_bot.sh &
+
+    - name: Health check and keep alive
+      run: |
+        # Wait for bot to start
+        sleep 30
+        
+        # Health check loop
+        for i in {1..600}; do
+          if curl -f http://localhost:9090 >/dev/null 2>&1; then
+            echo "✅ Bot is running healthy"
+            sleep 30
+          else
+            echo "❌ Health check failed, restarting..."
+            # Kill the restart script and let it restart
+            pkill -f "restart_bot.sh" || true
+            sleep 5
+            exit 1
+          fi
+        done
+
+  # Separate test job that doesn't interfere with deployment
+  test:
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    if: always()  # Run even if build fails
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Use Node.js 20.x
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20.x
+
+    - name: Install dependencies
+      run: |
+        if [ ! -f package-lock.json ]; then
+          npm install --package-lock-only
+        fi
+        npm ci
+
+    - name: Run basic tests
+      run: |
+        echo "Running basic validation checks..."
+        
+        # Check if main files exist
+        if [ ! -f "index.js" ]; then
+          echo "❌ index.js not found"
+          exit 1
+        fi
+        
+        if [ ! -f "config.js" ]; then
+          echo "❌ config.js not found"
+          exit 1
+        fi
+        
+        if [ ! -f "package.json" ]; then
+          echo "❌ package.json not found"
+          exit 1
+        fi
+        
+        # Check if required modules can be imported
+        if node -e "require('./config.js'); console.log('✅ config.js loads successfully')"; then
+          echo "✅ config.js is valid"
+        else
+          echo "❌ config.js has errors"
+          exit 1
+        fi
+        
+        echo "✅ All basic tests passed!"
